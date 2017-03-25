@@ -66,7 +66,7 @@ print_usage ()
   -l, --label=LAB    LAB is usually 'hourly', 'daily', or 'monthly'.
   -p, --prefix=PRE   PRE is 'zfs-auto-snap' by default.
   -q, --quiet        Suppress warnings and notices at the console.
-      --send-full=F  Send zfs full backup. Unimplemented.
+      --send-full=F  Send zfs full backup. Beta.
       --send-incr=F  Send zfs incremental backup. Unimplemented.
       --sep=CHAR     Use CHAR to separate date stamps in snapshot names.
   -g, --syslog       Write messages into the system log.
@@ -203,6 +203,155 @@ do_snapshots () # properties, flags, snapname, oldglob, [targets...]
 	done
 }
 
+do_exports () # properties, flags, snapname, oldglob, [targets...]
+{
+	local PROPS="$1"
+	local FLAGS="$2"
+	local NAME="$3"
+	local GLOB="$4"
+	local TARGETS="$5"
+	local KEEP=''
+	local RUNSNAP=1
+	local BACKUPDIR=$opt_do_export_full
+
+	# global DESTRUCTION_COUNT
+	# global SNAPSHOT_COUNT
+	# global WARNING_COUNT
+	# global SNAPSHOTS_OLD
+
+	if [-d $BACKUPDIR ]
+	then
+		#Create Array of directory's
+		IFS="/" read -ra DIRS <<-HERE
+			$BACKUPDIR
+			HERE
+		#Loop though directory's in reverse 	
+		for (( idx=${#DIRS[@]}-1 ; idx>=0 ; idx-- )) ; do
+			echo "${DIRS[idx]}"
+			#Finding the deepest mount point fs type
+			BASENAMEMOUNT=$(mount | grep ${DIRS[idx]})
+			MOUNTFS=$(echo $BASENAMEMOUNT | grep -oP "(?<=type )[^ ]+"| uniq)
+			if [ -n $MOUNTFS ] 
+			then 
+				break
+			fi			
+		done
+		#Need to test send type and if destination is zfs.
+		if [ $MOUNTFS = "zfs" ]
+		then
+			#sync snapshots
+			for ii in $TARGETS
+			do
+				if [ -n "$opt_do_snapshots" ]
+				then
+					if [ "$opt_pre_snapshot" != "" ]
+					then
+						do_run "$opt_pre_snapshot $ii $NAME" || RUNSNAP=0
+					fi
+					#Start exporting zfs
+					if [ $RUNSNAP -eq 1 ] && do_run "zfs send $PROPS $FLAGS '$ii@$NAME' | zfs recv ${BACKUPDIR#?}/$ii"
+					then
+						[ "$opt_post_snapshot" != "" ] && do_run "$opt_post_snapshot $ii $NAME"
+						SNAPSHOT_COUNT=$(( $SNAPSHOT_COUNT + 1 ))
+					else
+						WARNING_COUNT=$(( $WARNING_COUNT + 1 ))
+						continue
+					fi 
+				fi
+
+				# Retain at most $opt_keep number of old snapshots of this filesystem,
+				# including the one that was just recently created.
+				test -z "$opt_keep" && continue
+				KEEP="$opt_keep"
+
+				# ASSERT: The old snapshot list is sorted by increasing age.
+				for jj in $SNAPSHOTS_OLD
+				do
+					# Check whether this is an old snapshot of the filesystem.
+					if [ -z "${jj#$ii@$GLOB}" ]
+					then
+						KEEP=$(( $KEEP - 1 ))
+						if [ "$KEEP" -le '0' ]
+						then
+							if do_run "zfs destroy $FLAGS '$jj'" 
+							then
+								DESTRUCTION_COUNT=$(( $DESTRUCTION_COUNT + 1 ))
+							else
+								WARNING_COUNT=$(( $WARNING_COUNT + 1 ))
+							fi
+						fi
+					fi
+				done
+				# Need to look at snapshots on export volume
+				# ASSERT: The old snapshot list is sorted by increasing age.
+				# for jj in $SNAPSHOTS_OLD
+				# do
+					##Check whether this is an old snapshot of the filesystem.
+					# if [ -z "${jj#$ii@$GLOB}" ]
+					# then
+						# KEEP=$(( $KEEP - 1 ))
+						# if [ "$KEEP" -le '0' ]
+						# then
+							# if do_run "zfs destroy $FLAGS '$jj'" 
+							# then
+								# DESTRUCTION_COUNT=$(( $DESTRUCTION_COUNT + 1 ))
+							# else
+								# WARNING_COUNT=$(( $WARNING_COUNT + 1 ))
+							# fi
+						# fi
+					# fi
+				# done
+			done
+		else
+			#Create Snapshot and send as gz image
+			$SNAPNAME
+			for ii in $TARGETS
+			do
+				if [ -n "$opt_do_snapshots" ]
+				then
+					if [ "$opt_pre_snapshot" != "" ]
+					then
+						do_run "$opt_pre_snapshot $ii $NAME" || RUNSNAP=0
+					fi
+					if [ $RUNSNAP -eq 1 ] && do_run "zfs send $PROPS $FLAGS '$ii@$NAME' | grep > '$BACKUPDIR/$(echo $ii@$NAME | sed -e 's/\//_/g')'"
+					then
+						[ "$opt_post_snapshot" != "" ] && do_run "$opt_post_snapshot $ii $NAME"
+						SNAPSHOT_COUNT=$(( $SNAPSHOT_COUNT + 1 ))
+						
+					else
+						WARNING_COUNT=$(( $WARNING_COUNT + 1 ))
+						continue
+					fi 
+				fi
+
+				# Retain at most $opt_keep number of old snapshots of this filesystem,
+				# including the one that was just recently created.
+				test -z "$opt_keep" && continue
+				KEEP="$opt_keep"
+
+				# ASSERT: The old snapshot list is sorted by increasing age.
+				# for jj in $SNAPSHOTS_OLD
+				# do
+					##Check whether this is an old snapshot of the filesystem.
+					# if [ -z "${jj#$ii@$GLOB}" ]
+					# then
+						# KEEP=$(( $KEEP - 1 ))
+						# if [ "$KEEP" -le '0' ]
+						# then
+							# if do_run "zfs destroy $FLAGS '$jj'" 
+							# then
+								# DESTRUCTION_COUNT=$(( $DESTRUCTION_COUNT + 1 ))
+							# else
+								# WARNING_COUNT=$(( $WARNING_COUNT + 1 ))
+							# fi
+						# fi
+					# fi
+				# done
+			done
+		fi
+	   #done
+	fi
+}
 
 # main ()
 # {
@@ -566,6 +715,12 @@ test -n "$opt_dry_run" \
 
 do_snapshots "$SNAPPROP" ""   "$SNAPNAME" "$SNAPGLOB" "$TARGETS_REGULAR"
 do_snapshots "$SNAPPROP" "-r" "$SNAPNAME" "$SNAPGLOB" "$TARGETS_RECURSIVE"
+
+if [-n $opt_do_export_full] 
+then
+	do_exports "$SNAPPROP" ""   "$SNAPNAME" "$SNAPGLOB" "$TARGETS_REGULAR"
+	do_exports "$SNAPPROP" "-r" "$SNAPNAME" "$SNAPGLOB" "$TARGETS_RECURSIVE"
+fi
 
 print_log notice "@$SNAPNAME," \
   "$SNAPSHOT_COUNT created," \
